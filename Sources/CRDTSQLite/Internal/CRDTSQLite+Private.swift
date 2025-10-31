@@ -123,42 +123,34 @@ extension CRDTSQLite {
         let idColOld = RecordID.self == Int64.self ? "OLD.rowid" : "OLD.id"
 
         // INSERT trigger - track all columns as changed
-        var insertTrigger = """
+        let insertStatements = columns.map { col in
+            "    INSERT OR REPLACE INTO \(pendingTable) (operation, record_id, col_name)\n" +
+            "    VALUES (\(OperationType.insert.rawValue), \(idColNew), '\(col)');"
+        }.joined(separator: "\n")
+
+        let insertTrigger = """
             \(createClause) _crdt_\(tableName)_insert
             AFTER INSERT ON \(tableName)
             BEGIN
-
+            \(insertStatements)
+            END
             """
-
-        for col in columns {
-            insertTrigger += """
-                INSERT OR REPLACE INTO \(pendingTable) (operation, record_id, col_name)
-                VALUES (\(OperationType.insert.rawValue), \(idColNew), '\(col)');
-
-            """
-        }
-
-        insertTrigger += "END"
         try executeSQLOrThrow(db, insertTrigger)
 
         // UPDATE trigger - only track changed columns
-        var updateTrigger = """
+        let updateStatements = columns.map { col in
+            "    INSERT OR REPLACE INTO \(pendingTable) (operation, record_id, col_name)\n" +
+            "    SELECT \(OperationType.update.rawValue), \(idColNew), '\(col)'\n" +
+            "    WHERE OLD.\(col) IS NOT NEW.\(col);"
+        }.joined(separator: "\n")
+
+        let updateTrigger = """
             \(createClause) _crdt_\(tableName)_update
             AFTER UPDATE ON \(tableName)
             BEGIN
-
+            \(updateStatements)
+            END
             """
-
-        for col in columns {
-            updateTrigger += """
-                INSERT OR REPLACE INTO \(pendingTable) (operation, record_id, col_name)
-                SELECT \(OperationType.update.rawValue), \(idColNew), '\(col)'
-                WHERE OLD.\(col) IS NOT NEW.\(col);
-
-            """
-        }
-
-        updateTrigger += "END"
         try executeSQLOrThrow(db, updateTrigger)
 
         // DELETE trigger - col_name is empty string
@@ -276,6 +268,11 @@ extension CRDTSQLite {
             } else {
                 guard let columnName = change.columnName else { continue }
 
+                // Validate column name to prevent SQL injection
+                guard columnName.isValidColumnName else {
+                    throw CRDTError.internalError("Invalid column name in change: \(columnName)")
+                }
+
                 // Check if record exists
                 let idColumn = RecordID.self == Int64.self ? "rowid" : "id"
                 let checkStmt = try prepareSQLOrThrow(db, "SELECT 1 FROM \(tableName) WHERE \(idColumn) = ?")
@@ -318,6 +315,9 @@ extension CRDTSQLite {
                 }
 
                 // Update version table
+                guard currentClock < UInt64.max else {
+                    throw CRDTError.clockOverflow
+                }
                 currentClock += 1
                 try updateVersionTable(
                     tableName: tableName,
@@ -393,7 +393,10 @@ extension CRDTSQLite {
 
     internal func processPendingChanges() {
         guard let tableName = trackedTable else { return }
-        guard !processingWalChanges else { return }  // Prevent re-entry
+
+        // Prevent re-entry from nested WAL callbacks
+        // NOTE: Not thread-safe - this class must not be used from multiple threads
+        guard !processingWalChanges else { return }
 
         processingWalChanges = true
         defer { processingWalChanges = false }
@@ -423,6 +426,9 @@ extension CRDTSQLite {
             for (operation, recordId, columnName) in pendingChanges {
                 if operation == OperationType.delete.rawValue {
                     // Handle delete (tombstone)
+                    guard currentClock < UInt64.max else {
+                        throw CRDTError.clockOverflow
+                    }
                     currentClock += 1
 
                     let tombstonesTable = "_crdt_\(tableName)_tombstones"
@@ -458,6 +464,9 @@ extension CRDTSQLite {
 
                     // Increment version counters
                     colVersion += 1
+                    guard currentClock < UInt64.max else {
+                        throw CRDTError.clockOverflow
+                    }
                     currentClock += 1
 
                     // Update version table

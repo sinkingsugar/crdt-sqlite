@@ -47,10 +47,12 @@ extension UUID: CRDTRecordID {
         // This is a simple approach - production code might want a more sophisticated scheme
         var bytes = UUID().uuid
 
-        // Embed node ID in the first 8 bytes
-        withUnsafeBytes(of: nodeId.bigEndian) { nodeBytes in
-            for i in 0..<8 {
-                bytes.0 = nodeBytes[i]
+        // Embed node ID in the first 8 bytes by writing to the tuple via withUnsafeMutableBytes
+        withUnsafeMutableBytes(of: &bytes) { bytesPtr in
+            withUnsafeBytes(of: nodeId.bigEndian) { nodeBytes in
+                for i in 0..<min(8, bytesPtr.count) {
+                    bytesPtr[i] = nodeBytes[i]
+                }
             }
         }
 

@@ -89,8 +89,9 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
 
         // Install hooks using callback bridge
         let box = CallbackBox(handler: self)
-        let context = Unmanaged.passRetained(box).toOpaque()
-        self.callbackBox = Unmanaged.passRetained(box)
+        let unmanagedBox = Unmanaged.passRetained(box)
+        self.callbackBox = unmanagedBox
+        let context = unmanagedBox.toOpaque()
 
         sqlite3_set_authorizer(db, crdtAuthorizerCallback, context)
         sqlite3_wal_hook(db, crdtWalCallback, context)
