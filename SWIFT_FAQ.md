@@ -37,11 +37,12 @@ All modern systems meet this requirement.
 | iOS      | 13.0+          | ✅ Tested |
 | tvOS     | 13.0+          | ✅ Build verified |
 | watchOS  | 6.0+           | ✅ Build verified |
+| visionOS | 1.0+           | ✅ Build verified |
 | Linux    | Any (Swift 5.9+) | ✅ Tested |
 
 ### Swift Version Requirements
 
-- **Minimum**: Swift 5.7 (declared in Package.swift)
+- **Minimum**: Swift 5.9 (required for visionOS support)
 - **Tested**: Swift 5.9 and 5.10
 - **Recommended**: Swift 5.10+
 

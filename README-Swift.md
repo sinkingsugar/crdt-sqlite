@@ -1,6 +1,6 @@
 # CRDT-SQLite Swift Package
 
-A native Swift implementation of CRDT-SQLite, enabling automatic multi-node SQLite synchronization for iOS, macOS, tvOS, and watchOS applications.
+A native Swift implementation of CRDT-SQLite, enabling automatic multi-node SQLite synchronization for iOS, macOS, tvOS, watchOS, and visionOS applications.
 
 ## Features
 
@@ -10,7 +10,7 @@ A native Swift implementation of CRDT-SQLite, enabling automatic multi-node SQLi
 - ✅ **Type-Safe Values** - SQLiteValue enum provides safe SQLite value handling
 - ✅ **Automatic Change Tracking** - Uses SQLite triggers and WAL hooks transparently
 - ✅ **Column-Level Conflicts** - Fine-grained last-write-wins conflict resolution
-- ✅ **Cross-Platform** - iOS 13+, macOS 10.15+, tvOS 13+, watchOS 6+
+- ✅ **Cross-Platform** - iOS 13+, macOS 10.15+, tvOS 13+, watchOS 6+, visionOS 1+
 
 ## Installation
 
