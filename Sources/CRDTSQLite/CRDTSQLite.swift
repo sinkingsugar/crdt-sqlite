@@ -99,10 +99,16 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     }
 
     deinit {
+        // Remove SQLite hooks before cleanup to prevent callbacks during teardown
+        sqlite3_set_authorizer(db, nil, nil)
+        _ = sqlite3_wal_hook(db, nil, nil)
+        _ = sqlite3_rollback_hook(db, nil, nil)
+
         // Clean up callback box
-        if let box = callbackBox {
-            box.release()
-        }
+        callbackBox?.release()
+        callbackBox = nil
+
+        // Close database
         sqlite3_close(db)
     }
 
@@ -116,8 +122,8 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     /// - Parameter tableName: Name of the table to enable CRDT for (max 23 chars)
     /// - Throws: `CRDTError` if table doesn't exist or shadow tables cannot be created
     public func enableCRDT(for tableName: String) throws {
-        guard trackedTable == nil else {
-            throw CRDTError.internalError("CRDT already enabled for table: \(trackedTable!)")
+        if let existingTable = trackedTable {
+            throw CRDTError.internalError("CRDT already enabled for table: \(existingTable)")
         }
 
         // Validate table name
