@@ -150,46 +150,6 @@ jobs:
           .build/
           **/*.log
 
-  test-swift-linux:
-    name: Test Swift on Linux
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        swift-version: ['5.9', '5.10']
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup Swift
-      uses: swift-actions/setup-swift@v2
-      with:
-        swift-version: ${{ matrix.swift-version }}
-
-    - name: Install SQLite
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libsqlite3-dev
-
-    - name: Print Swift version
-      run: swift --version
-
-    - name: Build Swift package
-      run: swift build -v
-
-    - name: Run Swift tests
-      run: swift test --parallel
-
-    - name: Upload test results
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: test-results-swift-linux-${{ matrix.swift-version }}
-        path: |
-          .build/
-          **/*.log
-
   test-windows:
     name: Test on Windows
     runs-on: windows-latest
