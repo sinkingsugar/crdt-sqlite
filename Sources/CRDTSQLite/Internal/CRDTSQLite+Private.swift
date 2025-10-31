@@ -127,16 +127,18 @@ extension CRDTSQLite {
             \(createClause) _crdt_\(tableName)_insert
             AFTER INSERT ON \(tableName)
             BEGIN
+
             """
 
         for col in columns {
             insertTrigger += """
                 INSERT OR REPLACE INTO \(pendingTable) (operation, record_id, col_name)
                 VALUES (\(OperationType.insert.rawValue), \(idColNew), '\(col)');
-                """
+
+            """
         }
 
-        insertTrigger += " END"
+        insertTrigger += "END"
         try executeSQLOrThrow(db, insertTrigger)
 
         // UPDATE trigger - only track changed columns
@@ -144,6 +146,7 @@ extension CRDTSQLite {
             \(createClause) _crdt_\(tableName)_update
             AFTER UPDATE ON \(tableName)
             BEGIN
+
             """
 
         for col in columns {
@@ -151,10 +154,11 @@ extension CRDTSQLite {
                 INSERT OR REPLACE INTO \(pendingTable) (operation, record_id, col_name)
                 SELECT \(OperationType.update.rawValue), \(idColNew), '\(col)'
                 WHERE OLD.\(col) IS NOT NEW.\(col);
-                """
+
+            """
         }
 
-        updateTrigger += " END"
+        updateTrigger += "END"
         try executeSQLOrThrow(db, updateTrigger)
 
         // DELETE trigger - col_name is empty string
@@ -286,13 +290,31 @@ extension CRDTSQLite {
                     let updateStmt = try prepareSQLOrThrow(db, updateSQL)
                     defer { sqlite3_finalize(updateStmt) }
 
-                    change.value?.bind(to: updateStmt, at: 1) ?? sqlite3_bind_null(updateStmt, 1)
+                    _ = change.value?.bind(to: updateStmt, at: 1) ?? sqlite3_bind_null(updateStmt, 1)
                     try bindRecordId(change.recordId, to: updateStmt, at: 2)
                     sqlite3_step(updateStmt)
                 } else {
-                    // Insert new record (only if we have all required columns)
-                    // For simplicity, we just update the version table here
-                    // The actual insert should have been done by the originating node
+                    // Insert new record with just the ID and this column
+                    // CRDT builds up records column-by-column
+                    // Use INSERT OR IGNORE in case concurrent changes create the row
+                    let insertSQL = "INSERT OR IGNORE INTO \(tableName) (\(idColumn), \(columnName)) VALUES (?, ?)"
+                    let insertStmt = try prepareSQLOrThrow(db, insertSQL)
+                    defer { sqlite3_finalize(insertStmt) }
+
+                    try bindRecordId(change.recordId, to: insertStmt, at: 1)
+                    _ = change.value?.bind(to: insertStmt, at: 2) ?? sqlite3_bind_null(insertStmt, 2)
+                    let result = sqlite3_step(insertStmt)
+
+                    // If INSERT OR IGNORE didn't insert (row already exists), do an UPDATE
+                    if result == SQLITE_DONE && sqlite3_changes(db) == 0 {
+                        let updateSQL = "UPDATE \(tableName) SET \(columnName) = ? WHERE \(idColumn) = ?"
+                        let updateStmt = try prepareSQLOrThrow(db, updateSQL)
+                        defer { sqlite3_finalize(updateStmt) }
+
+                        _ = change.value?.bind(to: updateStmt, at: 1) ?? sqlite3_bind_null(updateStmt, 1)
+                        try bindRecordId(change.recordId, to: updateStmt, at: 2)
+                        sqlite3_step(updateStmt)
+                    }
                 }
 
                 // Update version table
@@ -517,7 +539,7 @@ extension CRDTSQLite {
         } else if RecordID.self == UUID.self {
             let uuid = recordId as! UUID
             let data = uuid.data
-            data.withUnsafeBytes { bytes in
+            _ = data.withUnsafeBytes { bytes in
                 sqlite3_bind_blob(stmt, index, bytes.baseAddress, Int32(bytes.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             }
         } else {

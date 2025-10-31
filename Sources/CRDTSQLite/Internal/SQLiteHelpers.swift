@@ -74,7 +74,7 @@ internal func executeSQL(_ db: OpaquePointer, _ sql: String) -> Int32 {
     let result = sqlite3_exec(db, sql, nil, nil, &errorMsg)
 
     if let errorMsg = errorMsg {
-        defer { sqlite3_free(errorMsg) }
+        sqlite3_free(errorMsg)
     }
 
     return result

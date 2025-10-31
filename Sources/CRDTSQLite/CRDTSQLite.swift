@@ -4,6 +4,19 @@
 import Foundation
 import SQLite3
 
+// MARK: - Constants and Types
+
+internal enum CRDTConstants {
+    static let maxTableNameLength = 23
+    static let maxExcludedNodes = 100
+}
+
+internal enum OperationType: Int32 {
+    case insert = 18  // SQLITE_INSERT
+    case update = 23  // SQLITE_UPDATE
+    case delete = 9   // SQLITE_DELETE
+}
+
 /// CRDT-enabled SQLite database wrapper
 ///
 /// This class wraps a SQLite database and enables CRDT synchronization
@@ -30,27 +43,17 @@ import SQLite3
 /// // Merge remote changes
 /// let accepted = try db.mergeChanges(remoteChanges)
 /// ```
-public final class CRDTSQLite<RecordID: CRDTRecordID> {
+public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     // MARK: - Properties
 
-    private let db: OpaquePointer
-    private let nodeId: UInt64
-    private var trackedTable: String?
-    private var columnTypes: [String: Int32] = [:]
-    private var pendingSchemaRefresh = false
-    private var processingWalChanges = false
-    private var clockOverflow = false
-
-    // MARK: - Constants
-
-    private enum OperationType: Int32 {
-        case insert = 18  // SQLITE_INSERT
-        case update = 23  // SQLITE_UPDATE
-        case delete = 9   // SQLITE_DELETE
-    }
-
-    private static let maxTableNameLength = 23
-    private static let maxExcludedNodes = 100
+    internal let db: OpaquePointer
+    internal let nodeId: UInt64
+    internal var trackedTable: String?
+    internal var columnTypes: [String: Int32] = [:]
+    internal var pendingSchemaRefresh = false
+    internal var processingWalChanges = false
+    internal var clockOverflow = false
+    private var callbackBox: Unmanaged<CallbackBox>?
 
     // MARK: - Initialization
 
@@ -84,29 +87,21 @@ public final class CRDTSQLite<RecordID: CRDTRecordID> {
         // Enable WAL mode for better concurrency
         try executeSQLOrThrow(db, "PRAGMA journal_mode=WAL")
 
-        // Install hooks using context pointer
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        sqlite3_set_authorizer(db, { ctx, action, arg1, arg2, arg3, arg4 in
-            guard let ctx = ctx else { return SQLITE_OK }
-            let wrapper = Unmanaged<CRDTSQLite<RecordID>>.fromOpaque(ctx).takeUnretainedValue()
-            return wrapper.authorizerCallback(action: action, arg1: arg1, arg2: arg2, arg3: arg3, arg4: arg4)
-        }, context)
+        // Install hooks using callback bridge
+        let box = CallbackBox(handler: self)
+        let context = Unmanaged.passRetained(box).toOpaque()
+        self.callbackBox = Unmanaged.passRetained(box)
 
-        sqlite3_wal_hook(db, { ctx, db, dbName, numPages in
-            guard let ctx = ctx else { return SQLITE_OK }
-            let wrapper = Unmanaged<CRDTSQLite<RecordID>>.fromOpaque(ctx).takeUnretainedValue()
-            wrapper.walCallback(numPages: numPages)
-            return SQLITE_OK
-        }, context)
-
-        sqlite3_rollback_hook(db, { ctx in
-            guard let ctx = ctx else { return }
-            let wrapper = Unmanaged<CRDTSQLite<RecordID>>.fromOpaque(ctx).takeUnretainedValue()
-            wrapper.rollbackCallback()
-        }, context)
+        sqlite3_set_authorizer(db, crdtAuthorizerCallback, context)
+        sqlite3_wal_hook(db, crdtWalCallback, context)
+        sqlite3_rollback_hook(db, crdtRollbackCallback, context)
     }
 
     deinit {
+        // Clean up callback box
+        if let box = callbackBox {
+            box.release()
+        }
         sqlite3_close(db)
     }
 
@@ -129,8 +124,8 @@ public final class CRDTSQLite<RecordID: CRDTRecordID> {
             throw CRDTError.tableNameInvalid(tableName)
         }
 
-        guard tableName.count <= Self.maxTableNameLength else {
-            throw CRDTError.tableNameTooLong(tableName, maxLength: Self.maxTableNameLength)
+        guard tableName.count <= CRDTConstants.maxTableNameLength else {
+            throw CRDTError.tableNameTooLong(tableName, maxLength: CRDTConstants.maxTableNameLength)
         }
 
         // Check if table exists
@@ -290,8 +285,8 @@ public final class CRDTSQLite<RecordID: CRDTRecordID> {
             throw CRDTError.noTrackedTable
         }
 
-        guard excluding.count <= Self.maxExcludedNodes else {
-            throw CRDTError.tooManyExcludedNodes(count: excluding.count, max: Self.maxExcludedNodes)
+        guard excluding.count <= CRDTConstants.maxExcludedNodes else {
+            throw CRDTError.tooManyExcludedNodes(count: excluding.count, max: CRDTConstants.maxExcludedNodes)
         }
 
         var changes: [Change<RecordID>] = []
@@ -410,7 +405,7 @@ public final class CRDTSQLite<RecordID: CRDTRecordID> {
         var acceptedChanges: [Change<RecordID>] = []
 
         // Process each change
-        for var remoteChange in changes {
+        for remoteChange in changes {
             // Check if this is a tombstone
             if remoteChange.isTombstone {
                 // Check local tombstone

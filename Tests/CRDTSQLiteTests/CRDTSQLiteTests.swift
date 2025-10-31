@@ -225,14 +225,14 @@ final class CRDTSQLiteTests: XCTestCase {
         // Node 1 inserts Alice
         try db1.execute("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')")
 
-        // Node 2 inserts Bob
-        try db2.execute("INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com')")
-
-        // Sync: db1 -> db2
+        // Sync db1 -> db2 (Alice goes to db2)
         let changes1 = try db1.getChangesSince(0)
         _ = try db2.mergeChanges(changes1)
 
-        // Sync: db2 -> db1
+        // Now Node 2 inserts Bob (after receiving Alice)
+        try db2.execute("INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com')")
+
+        // Sync db2 -> db1 (Bob goes to db1)
         let changes2 = try db2.getChangesSince(0)
         _ = try db1.mergeChanges(changes2)
 
