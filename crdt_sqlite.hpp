@@ -2,7 +2,7 @@
 #ifndef CRDT_SQLITE_HPP
 #define CRDT_SQLITE_HPP
 
-#include "crdt.hpp"
+#include "crdt_types.hpp"
 #include "record_id_types.hpp"
 #include <sqlite3.h>
 #include <string>

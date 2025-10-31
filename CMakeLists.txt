@@ -45,7 +45,7 @@ add_library(crdt_sqlite STATIC
   crdt_sqlite.cpp
   crdt_sqlite.hpp
   record_id_types.hpp
-  crdt.hpp
+  crdt_types.hpp
 )
 
 target_include_directories(crdt_sqlite PUBLIC
@@ -80,7 +80,7 @@ if(BUILD_TESTS)
       crdt_sqlite.cpp
       crdt_sqlite.hpp
       record_id_types.hpp
-      crdt.hpp
+      crdt_types.hpp
     )
     target_compile_definitions(crdt_sqlite_uint128 PRIVATE CRDT_RECORD_ID_TYPE=__uint128_t)
     target_link_libraries(crdt_sqlite_uint128 PUBLIC SQLite::SQLite3)
