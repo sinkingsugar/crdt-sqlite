@@ -3,11 +3,6 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize]
-    # Only run on specific file changes
-    paths:
-      - "**/*.h"
-      - "**/*.hpp"
-      - "**/*.cpp"
 
 jobs:
   claude-review:
