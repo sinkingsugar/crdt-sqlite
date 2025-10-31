@@ -21,6 +21,9 @@ internal final class CallbackBox {
 }
 
 // MARK: - C Function Callbacks
+//
+// SAFETY: These C callbacks MUST NOT throw or crash.
+// All Swift handler methods MUST handle their own errors internally.
 
 internal func crdtAuthorizerCallback(
     ctx: UnsafeMutableRawPointer?,

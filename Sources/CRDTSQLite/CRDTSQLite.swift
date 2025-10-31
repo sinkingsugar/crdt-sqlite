@@ -403,9 +403,13 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
             throw CRDTError.noTrackedTable
         }
 
+        // Use transaction for performance with large changesets
+        try executeSQLOrThrow(db, "BEGIN TRANSACTION")
+
         var acceptedChanges: [Change<RecordID>] = []
 
-        // Process each change
+        do {
+            // Process each change
         for remoteChange in changes {
             // Check if this is a tombstone
             if remoteChange.isTombstone {
@@ -476,12 +480,21 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
             }
         }
 
-        // Apply accepted changes to SQLite
-        if !acceptedChanges.isEmpty {
-            try applyToSQLite(changes: acceptedChanges)
-        }
+            // Apply accepted changes to SQLite
+            if !acceptedChanges.isEmpty {
+                try applyToSQLite(changes: acceptedChanges)
+            }
 
-        return acceptedChanges
+            // Commit transaction
+            try executeSQLOrThrow(db, "COMMIT")
+
+            return acceptedChanges
+
+        } catch {
+            // Rollback on error
+            try? executeSQLOrThrow(db, "ROLLBACK")
+            throw error
+        }
     }
 
     /// Compacts tombstones older than the specified version

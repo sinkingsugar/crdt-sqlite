@@ -114,20 +114,6 @@ internal func prepareSQLOrThrow(_ db: OpaquePointer, _ sql: String) throws -> Op
 }
 
 // MARK: - Processing Guard
-
-/// RAII guard for boolean flags
-///
-/// Sets a flag to true on init, restores it to false on deinit.
-/// Ensures flags are always reset even if exceptions occur.
-internal final class ProcessingGuard {
-    private let flag: UnsafeMutablePointer<Bool>
-
-    init(_ flag: inout Bool) {
-        self.flag = withUnsafeMutablePointer(to: &flag) { $0 }
-        self.flag.pointee = true
-    }
-
-    deinit {
-        flag.pointee = false
-    }
-}
+//
+// NOTE: Previously had ProcessingGuard class with UB (pointer escape).
+// Use defer instead for RAII pattern with Bool flags.
