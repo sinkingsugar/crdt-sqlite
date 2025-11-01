@@ -1,18 +1,46 @@
 # CRDT-SQLite: Conflict-Free Replicated SQLite Database
 
-A high-performance CRDT wrapper for SQLite that enables automatic multi-node synchronization with last-write-wins conflict resolution.
+A high-performance CRDT wrapper for SQLite that enables automatic multi-node synchronization with last-write-wins conflict resolution. Available in both **C++** and **Swift** with identical wire format compatibility.
 
-## Features
+## Why CRDT-SQLite?
 
-- 🚀 **High performance**: Hybrid trigger + async processing (benchmarks pending)
-- 💾 **Crash-safe**: Survives power loss between commit and metadata update
-- 🔄 **Automatic sync**: Changes tracked transparently using triggers
-- 🎯 **Column-level conflicts**: Fine-grained conflict resolution per field
-- 🌍 **Cross-platform**: Linux, macOS, Windows (with custom SQLite build)
-- 📦 **Zero code changes**: Existing SQL apps work without modification
-- ✏️ **Normal SQL writes**: Unlike cr-sqlite, no virtual tables = normal INSERT/UPDATE/DELETE works!
+- **Write Normal SQL**: Unlike cr-sqlite, use standard INSERT/UPDATE/DELETE (no virtual tables!)
+- **Automatic Change Tracking**: SQLite triggers handle everything transparently
+- **Column-Level Conflicts**: Fine-grained last-write-wins resolution per field
+- **Cross-Platform**: C++ (Linux/macOS/Windows) and Swift (iOS/macOS/tvOS/watchOS/visionOS)
+- **Wire Compatible**: C++ and Swift nodes can sync with each other seamlessly
+- **Zero Code Changes**: Existing SQL applications work without modification
+
+## Choose Your Language
+
+### C++ Implementation
+Best for: Desktop apps, servers, cross-platform tools, SQLite-heavy applications
+
+**Key Features:**
+- High performance with hybrid trigger + async processing
+- Normal SQL writes (no special APIs required)
+- CMake build system
+- Raw SQLite API access
+
+[📘 C++ API Documentation](docs/cpp-api.md)
+
+### Swift Implementation
+Best for: iOS, macOS, Apple ecosystem applications
+
+**Key Features:**
+- Native Swift API with proper error handling
+- Codable support for automatic JSON serialization
+- Generic record IDs (Int64 or UUID)
+- Type-safe SQLiteValue enum
+- Swift Package Manager integration
+
+[📗 Swift API Documentation](docs/swift-api.md)
+
+---
 
 ## Quick Start
+
+### C++ Quick Start
 
 ```cpp
 #include "crdt_sqlite.hpp"
@@ -24,25 +52,55 @@ CRDTSQLite db("myapp.db", 1);
 db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
 db.enable_crdt("users");
 
-// Use normal SQL - changes are tracked automatically by triggers!
-// You can use execute() wrapper (convenient)...
+// Use normal SQL - changes are tracked automatically!
 db.execute("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')");
-
-// ...or raw SQLite APIs (also works!)
-sqlite3_exec(db.get_db(), "UPDATE users SET email = 'new@example.com' WHERE name = 'Alice'",
-             nullptr, nullptr, nullptr);
+db.execute("UPDATE users SET email = 'new@example.com' WHERE name = 'Alice'");
 
 // Get changes since last sync
 auto changes = db.get_changes_since(0);
 
-// Send to other nodes...
-// Then merge incoming changes
+// Merge incoming changes from other nodes
 db.merge_changes(remote_changes);
 ```
 
-## Architecture: Triggers + WAL Hook
+[📘 Full C++ API Reference](docs/cpp-api.md)
 
-### Design Philosophy
+### Swift Quick Start
+
+```swift
+import CRDTSQLite
+
+// Create database with unique node ID
+let db = try CRDTSQLite<Int64>(path: "myapp.db", nodeId: 1)
+
+// Create table and enable CRDT
+try db.execute("""
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        email TEXT
+    )
+""")
+try db.enableCRDT(for: "users")
+
+// Use normal SQL - changes are tracked automatically!
+try db.execute("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')")
+
+// Get changes since last sync
+let changes = try db.getChangesSince(lastVersion)
+
+// Serialize to JSON (Codable!)
+let jsonData = try JSONEncoder().encode(changes)
+
+// Merge incoming changes from other nodes
+let acceptedChanges = try db.mergeChanges(remoteChanges)
+```
+
+[📗 Full Swift API Reference](docs/swift-api.md)
+
+---
+
+## Architecture: Triggers + WAL Hook
 
 CRDT-SQLite uses a **hybrid trigger + WAL hook** architecture that combines crash safety with high performance:
 
@@ -89,42 +147,13 @@ CRDT-SQLite uses a **hybrid trigger + WAL hook** architecture that combines cras
   └────────────────────────────────────────┘
 ```
 
-### Performance Comparison
+**Key Insight**: The `wal_hook` callback fires **AFTER** commit with all locks released, enabling fast metadata updates without blocking writers.
 
-| Approach | Lock Duration | Overhead | Crash Safe | Expected Performance |
-|----------|---------------|----------|------------|---------------------|
-| **cr-sqlite** (pure triggers) | Long | High | Yes | Baseline |
-| **update_hook + vector** | Short | Low | ❌ No | Fast but unsafe |
-| **Ours** (triggers + wal_hook) | Short | Medium | ✅ Yes | **TBD** (benchmarks needed) |
-
-**Hypothesis**: Should be significantly faster than cr-sqlite because:
-- Triggers only INSERT into `_pending` (minimal work during write)
-- Heavy metadata updates happen in wal_hook AFTER locks released
-- Shorter critical section = less contention
-
-**Note**: Formal benchmarks comparing against cr-sqlite are planned but not yet completed.
-
-**Key Insight**: The `wal_hook` callback fires **AFTER** commit with all locks released, making `prepare()`/`step()` calls 100% safe.
-
-## Comparison with cr-sqlite
-
-| Feature | **CRDT-SQLite** (Ours) | cr-sqlite |
-|---------|------------------------|-----------|
-| **Write API** | ✅ Normal SQL (INSERT/UPDATE/DELETE) | ❌ Virtual tables (special functions required) |
-| **Read API** | ✅ Normal SELECT | ✅ Normal SELECT |
-| **CRDT metadata access** | C++ APIs only | ✅ SQL queries (via virtual tables) |
-| **Architecture** | Triggers + wal_hook | Virtual tables + triggers |
-| **Learning curve** | Low (just SQL) | Higher (learn cr-sqlite API) |
-| **Existing code** | Works unchanged | Requires rewrite |
-| **Performance** | TBD (benchmarks pending) | Established baseline |
-
-**Key advantage:** Our trigger-based approach means you write normal SQL - no special APIs, no virtual tables, no code changes. Just enable CRDT on a table and keep writing SQL like you always have.
-
-**Tradeoff:** cr-sqlite exposes CRDT metadata (versions, clocks) via SQL queries, while we provide C++ APIs (`get_changes_since()`, `merge_changes()`). If you prefer C++ over SQL for sync logic, this is actually cleaner.
+---
 
 ## Shadow Tables
 
-When you call `enable_crdt("users")`, four shadow tables are created:
+When you enable CRDT for a table (e.g., `users`), four shadow tables are automatically created:
 
 ### 1. `_crdt_users_versions`
 Tracks the version of each column:
@@ -169,152 +198,149 @@ CREATE TABLE _crdt_users_pending (
 );
 ```
 
-## API Reference
-
-### Constructor
-
-```cpp
-CRDTSQLite(const char *path, CrdtNodeId node_id);
-```
-
-- **path**: Path to SQLite database file
-- **node_id**: Unique identifier for this node
-
-### Core Methods
-
-#### `enable_crdt(const std::string &table_name)`
-Enables CRDT synchronization for a table. Creates triggers that automatically track changes.
-
-**Schema Change Support:**
-- ✅ ALTER TABLE ADD COLUMN - fully automatic
-- ❌ DROP TABLE - blocked
-- ⚠️ RENAME TABLE - not blocked but WILL BREAK
-- ⚠️ DROP/RENAME COLUMN - not supported
-
-#### `execute(const char *sql)` **[Optional Convenience Wrapper]**
-Executes SQL with exception-based error handling and automatic schema refresh.
-
-**What it does:**
-- Wraps `sqlite3_exec()` with exception throwing
-- Auto-calls `refresh_schema()` after ALTER TABLE
-
-**Alternative: Use Raw SQLite APIs**
-
-Since triggers and `wal_hook` handle everything automatically, you can use raw SQLite APIs directly:
-
-```cpp
-CRDTSQLite db("myapp.db", 1);
-db.enable_crdt("users");
-
-// Option 1: Use execute() wrapper (convenience)
-db.execute("INSERT INTO users (name) VALUES ('Alice')");
-
-// Option 2: Use raw sqlite3_exec() (also works!)
-sqlite3_exec(db.get_db(), "INSERT INTO users (name) VALUES ('Bob')",
-             nullptr, nullptr, nullptr);
-
-// Option 3: Use prepare/step (already exposed)
-sqlite3_stmt *stmt = db.prepare("INSERT INTO users (name) VALUES (?)");
-sqlite3_bind_text(stmt, 1, "Charlie", -1, SQLITE_STATIC);
-sqlite3_step(stmt);
-sqlite3_finalize(stmt);
-
-// All three options work! Triggers fire automatically.
-// Changes are processed asynchronously by wal_hook after commit.
-// Only caveat: Call refresh_schema() manually after ALTER TABLE (typically during migrations)
-```
-
-**Change Processing:**
-- Triggers populate `_pending` table during writes (fast, in transaction)
-- `wal_hook` fires **AFTER** commit (locks released) and processes pending changes
-- This happens automatically - no manual flush needed
-- Both `execute()` and raw SQLite APIs benefit from this architecture
-
-#### `refresh_schema()`
-Refreshes internal column metadata after schema changes.
-
-**When to call:**
-- After ALTER TABLE ADD COLUMN (typically at end of migration)
-- Only needed if using raw SQLite APIs instead of `execute()`
-
-#### `prepare(const char *sql)`
-Prepares a SQL statement for parameterized queries. Returns `sqlite3_stmt*` (caller must finalize).
-
-#### `get_db()`
-Returns raw `sqlite3*` handle for direct SQLite API access.
-
-#### `get_changes_since(uint64_t last_db_version, size_t max_changes = 0)`
-Gets all changes since a given version.
-
-#### `merge_changes(std::vector<Change<...>> changes)`
-Merges changes from another node using LWW conflict resolution.
-
-#### `compact_tombstones(uint64_t min_acknowledged_version)`
-Removes old tombstones.
-
-⚠️ **CRITICAL**: Only call when ALL nodes have acknowledged the version!
+---
 
 ## Conflict Resolution
 
 ### Last-Write-Wins (LWW)
 
-Conflicts are resolved per-column using three-way comparison:
+Conflicts are resolved **per-column** using three-way comparison:
 
 1. **Column version** (higher wins)
 2. **DB version** (higher wins if column versions equal)
 3. **Node ID** (deterministic tie-breaker)
 
-Example:
+**Example:**
 ```cpp
 // Node 1 updates email
 db1.execute("UPDATE users SET email = 'alice@foo.com' WHERE id = 1");
 
-// Node 2 updates name (concurrent)
+// Node 2 updates name (concurrent edit)
 db2.execute("UPDATE users SET name = 'Alice Smith' WHERE id = 1");
 
 // After sync: BOTH changes are kept!
-// Different columns don't conflict!
+// Different columns don't conflict - fine-grained resolution!
 ```
+
+---
+
+## Synchronization Workflow
+
+Both C++ and Swift implementations follow the same pattern:
+
+1. **Get changes** from local database since last sync version
+2. **Send changes** to remote nodes (over network, JSON, protobuf, etc.)
+3. **Receive changes** from remote nodes
+4. **Merge changes** using LWW conflict resolution
+5. **Compact tombstones** when all nodes have acknowledged (optional)
+
+**Wire Format Compatibility**: C++ and Swift nodes can sync with each other - they use identical shadow table schemas and serialization formats.
+
+---
 
 ## Threading Model
 
-⚠️ **CRDTSQLite is NOT thread-safe**
+⚠️ **Neither implementation is thread-safe**
 
-**Safe usage:**
+**Safe usage patterns:**
 - One instance per thread (each with own database connection)
 - Protect ALL access with external mutex
-- We use `SQLITE_OPEN_FULLMUTEX` for proper mutex protection
+- Both use `SQLITE_OPEN_FULLMUTEX` for proper SQLite mutex protection
 
-## Windows Platform Notes
+---
 
-Windows CI builds SQLite from source with explicit threading flags:
+## Schema Changes
 
-```powershell
-# Download SQLite amalgamation
-Invoke-WebRequest -Uri "https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip"
+| Operation | Support Level |
+|-----------|---------------|
+| **ALTER TABLE ADD COLUMN** | ✅ Fully supported, automatic |
+| **DROP TABLE** | ❌ Blocked (would orphan shadow tables) |
+| **RENAME TABLE** | ⚠️ Not blocked but WILL BREAK shadow tables |
+| **DROP COLUMN** | ⚠️ Not supported (metadata corruption) |
+| **RENAME COLUMN** | ⚠️ Not supported (metadata corruption) |
 
-# Compile with FULLMUTEX threading
-cl /c /O2 /DSQLITE_THREADSAFE=1 sqlite3.c
-lib /OUT:sqlite3.lib sqlite3.obj
-```
+---
 
-**Why?** vcpkg SQLite may use different default threading modes, causing mutex assertion crashes.
+## Installation & Building
 
-## Building
+### C++ Installation
 
-### Prerequisites
+**Prerequisites:**
 - C++20 compiler
 - CMake 3.15+
 - SQLite3 development libraries
 
-### Build Instructions
-
+**Build Instructions:**
 ```bash
 mkdir build && cd build
 cmake .. -DBUILD_TESTS=ON
 cmake --build .
 ctest --output-on-failure
 ```
+
+[📘 Full C++ Build Documentation](docs/cpp-api.md#building)
+
+### Swift Installation
+
+**Swift Package Manager:**
+
+Add to your `Package.swift`:
+```swift
+dependencies: [
+    .package(url: "https://github.com/sinkingsugar/crdt-sqlite", from: "1.0.0")
+]
+```
+
+Or in Xcode: **File → Add Packages → Enter repository URL**
+
+**Platform Support:**
+- iOS 13+
+- macOS 10.15+
+- tvOS 13+
+- watchOS 6+
+- visionOS 1+
+
+[📗 Full Swift Installation Guide](docs/swift-api.md#installation)
+
+---
+
+## Comparison with cr-sqlite
+
+| Feature | **CRDT-SQLite** (Ours) | cr-sqlite |
+|---------|------------------------|-----------|
+| **Write API** | ✅ Normal SQL (INSERT/UPDATE/DELETE) | ❌ Virtual tables (special functions required) |
+| **Read API** | ✅ Normal SELECT | ✅ Normal SELECT |
+| **CRDT metadata access** | C++/Swift APIs | ✅ SQL queries (via virtual tables) |
+| **Architecture** | Triggers + wal_hook | Virtual tables + triggers |
+| **Learning curve** | Low (just SQL) | Higher (learn cr-sqlite API) |
+| **Existing code** | Works unchanged | Requires rewrite |
+| **Performance** | TBD (benchmarks pending) | Established baseline |
+
+**Key advantage:** Our trigger-based approach means you write normal SQL - no special APIs, no virtual tables, no code changes. Just enable CRDT on a table and keep writing SQL like you always have.
+
+---
+
+## Performance Notes
+
+### C++ Performance
+
+**Hypothesis**: Should be significantly faster than cr-sqlite because:
+- Triggers only INSERT into `_pending` (minimal work during write)
+- Heavy metadata updates happen in wal_hook AFTER locks released
+- Shorter critical section = less contention
+
+**Note**: Formal benchmarks comparing against cr-sqlite are planned but not yet completed.
+
+### Swift Performance
+
+The Swift implementation has an estimated ~10-20% overhead compared to C++ due to:
+- ARC memory management
+- Swift/C bridging for SQLite calls
+- Type-safe value wrapping
+
+For most applications, the ergonomic benefits of Swift (Codable, type safety, error handling) outweigh this small overhead.
+
+---
 
 ## Related Projects
 
@@ -324,6 +350,17 @@ ctest --output-on-failure
   - Text CRDT for collaborative editing
   - Use crdt-lite for: in-memory state, game sync, real-time collaboration
   - Use crdt-sqlite for: persistent storage, database-backed apps, SQLite integration
+
+---
+
+## Documentation
+
+- [📘 C++ API Reference](docs/cpp-api.md) - Complete C++ API, threading, Windows notes
+- [📗 Swift API Reference](docs/swift-api.md) - Complete Swift API, Codable, UUID support
+- [🔄 Swift Implementation Status](docs/SWIFT_IMPLEMENTATION.md) - Feature parity tracking
+- [❓ Swift FAQ](docs/SWIFT_FAQ.md) - Platform support, troubleshooting
+
+---
 
 ## License
 
