@@ -186,8 +186,14 @@ void CRDTSQLite::create_shadow_tables(const std::string &table_name) {
     );
   }
 
-  // Determine record_id SQL type
-  std::string record_id_type = RecordIdTraits<CrdtRecordId>::sql_type();
+  // Wrap entire shadow table creation in transaction for atomicity
+  // Without this, a crash during schema creation could leave database in inconsistent state
+  // (e.g., versions table created but triggers not created, causing silent data loss)
+  exec_or_throw("BEGIN TRANSACTION");
+
+  try {
+    // Determine record_id SQL type
+    std::string record_id_type = RecordIdTraits<CrdtRecordId>::sql_type();
 
   // Create versions table
   std::string versions_table = "_crdt_" + table_name + "_versions";
@@ -209,6 +215,11 @@ void CRDTSQLite::create_shadow_tables(const std::string &table_name) {
                                     "_local_db_version_idx ON " + versions_table + "(local_db_version)";
   exec_or_throw(create_versions_idx.c_str());
 
+  // PERFORMANCE: Create index on node_id for efficient node filtering during sync
+  std::string create_versions_node_idx = "CREATE INDEX IF NOT EXISTS " + versions_table +
+                                         "_node_id_idx ON " + versions_table + "(node_id)";
+  exec_or_throw(create_versions_node_idx.c_str());
+
   // Create tombstones table
   std::string tombstones_table = "_crdt_" + table_name + "_tombstones";
   std::string create_tombstones = R"(
@@ -226,6 +237,11 @@ void CRDTSQLite::create_shadow_tables(const std::string &table_name) {
                                       "_local_db_version_idx ON " + tombstones_table + "(local_db_version)";
   exec_or_throw(create_tombstones_idx.c_str());
 
+  // PERFORMANCE: Create index on node_id for efficient node filtering during sync
+  std::string create_tombstones_node_idx = "CREATE INDEX IF NOT EXISTS " + tombstones_table +
+                                           "_node_id_idx ON " + tombstones_table + "(node_id)";
+  exec_or_throw(create_tombstones_node_idx.c_str());
+
   // Create clock table
   std::string clock_table = "_crdt_" + table_name + "_clock";
   std::string create_clock = R"(
@@ -242,7 +258,11 @@ void CRDTSQLite::create_shadow_tables(const std::string &table_name) {
   if (rc != SQLITE_OK) {
     throw CRDTSQLiteException("Failed to prepare clock check: " + get_error());
   }
-  sqlite3_step(stmt);
+  rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    throw CRDTSQLiteException("Failed to check clock table: " + get_error());
+  }
   int count = sqlite3_column_int(stmt, 0);
   sqlite3_finalize(stmt);
 
@@ -287,8 +307,11 @@ void CRDTSQLite::create_shadow_tables(const std::string &table_name) {
     }
     sqlite3_bind_text(stmt, 1, col_name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, static_cast<int>(col_type));
-    sqlite3_step(stmt);
+    rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+      throw CRDTSQLiteException("Failed to insert column type for " + col_name + ": " + get_error());
+    }
   }
 
   // For non-auto-increment types (e.g., uint128_t), create lookaside table
@@ -316,21 +339,20 @@ void CRDTSQLite::create_shadow_tables(const std::string &table_name) {
     id_column = "NEW.id";
   }
 
-  // Get column names for per-column change tracking
-  std::vector<std::string> columns;
-  {
-    std::string pragma_sql = "PRAGMA table_info(" + table_name + ")";
-    Statement stmt(prepare(pragma_sql.c_str()));
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-      const char *col_name = reinterpret_cast<const char *>(sqlite3_column_text(stmt.get(), 1));
-      if (col_name) {
-        columns.push_back(col_name);
-      }
-    }
-  }
+  // PERFORMANCE: Use cached column names from cache_column_types() to avoid redundant PRAGMA query
+  // cache_column_types() was called earlier in enable_crdt(), so cached_columns_ is populated
+  std::vector<std::string> columns = cached_columns_;
 
   // Create INSERT, UPDATE, DELETE triggers
   create_triggers(table_name, columns, /* use_if_not_exists= */ true);
+
+    // Commit transaction - shadow tables created successfully
+    exec_or_throw("COMMIT");
+  } catch (...) {
+    // Rollback on any exception to maintain database consistency
+    exec_or_throw("ROLLBACK");
+    throw;  // Re-throw exception after rollback
+  }
 }
 
 void CRDTSQLite::create_triggers(const std::string &table_name,
@@ -386,6 +408,11 @@ void CRDTSQLite::create_triggers(const std::string &table_name,
 }
 
 void CRDTSQLite::cache_column_types(const std::string &table_name) {
+  // SECURITY: Validate table name before using in PRAGMA (cannot use parameter binding)
+  if (!is_valid_table_name(table_name)) {
+    throw CRDTSQLiteException("Invalid table name for PRAGMA: " + table_name);
+  }
+
   std::string pragma_sql = "PRAGMA table_info(" + table_name + ")";
   sqlite3_stmt *stmt;
   int rc = sqlite3_prepare_v2(db_, pragma_sql.c_str(), -1, &stmt, nullptr);
@@ -393,9 +420,16 @@ void CRDTSQLite::cache_column_types(const std::string &table_name) {
     throw CRDTSQLiteException("Failed to prepare PRAGMA table_info: " + get_error());
   }
 
+  // Clear both caches before repopulating
+  column_types_.clear();
+  cached_columns_.clear();
+
   while (sqlite3_step(stmt) == SQLITE_ROW) {
     std::string col_name = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
     std::string col_type = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
+
+    // PERFORMANCE: Cache column name to avoid redundant PRAGMA queries
+    cached_columns_.push_back(col_name);
 
     // Map SQLite type affinity to our Type enum
     SQLiteValue::Type type = SQLiteValue::TEXT; // default
@@ -434,8 +468,11 @@ void CRDTSQLite::refresh_schema() {
     }
     sqlite3_bind_text(stmt, 1, col_name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, static_cast<int>(col_type));
-    sqlite3_step(stmt);
+    rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+      throw CRDTSQLiteException("Failed to update column type for " + col_name + ": " + get_error());
+    }
   }
 
   // CRITICAL: Regenerate triggers to include new columns
@@ -444,11 +481,9 @@ void CRDTSQLite::refresh_schema() {
   exec_or_throw(("DROP TRIGGER IF EXISTS _crdt_" + tracked_table_ + "_update").c_str());
   exec_or_throw(("DROP TRIGGER IF EXISTS _crdt_" + tracked_table_ + "_delete").c_str());
 
-  // Get current column list
-  std::vector<std::string> columns;
-  for (const auto& [col_name, col_type] : column_types_) {
-    columns.push_back(col_name);
-  }
+  // PERFORMANCE: Use cached column names from cache_column_types() (called earlier in this function)
+  // This avoids another PRAGMA query
+  std::vector<std::string> columns = cached_columns_;
 
   // Recreate INSERT, UPDATE, DELETE triggers with updated column list
   create_triggers(tracked_table_, columns, /* use_if_not_exists= */ false);
@@ -796,7 +831,10 @@ CRDTSQLite::merge_changes(std::vector<Change<CrdtRecordId, std::string>> changes
           sqlite3_bind_int64(stmt.get(), 2, remote.db_version);
           sqlite3_bind_int64(stmt.get(), 3, remote.node_id);
           sqlite3_bind_int64(stmt.get(), 4, current_clock);
-          sqlite3_step(stmt.get());
+          int rc = sqlite3_step(stmt.get());
+          if (rc != SQLITE_DONE) {
+            throw CRDTSQLiteException("Failed to insert tombstone: " + get_error());
+          }
           // Statement auto-finalized here
         }
 
@@ -858,7 +896,10 @@ CRDTSQLite::merge_changes(std::vector<Change<CrdtRecordId, std::string>> changes
           sqlite3_bind_int64(stmt.get(), 4, remote.db_version);
           sqlite3_bind_int64(stmt.get(), 5, remote.node_id);
           sqlite3_bind_int64(stmt.get(), 6, current_clock);
-          sqlite3_step(stmt.get());
+          int rc = sqlite3_step(stmt.get());
+          if (rc != SQLITE_DONE) {
+            throw CRDTSQLiteException("Failed to update version metadata: " + get_error());
+          }
           // Statement auto-finalized here
         }
 
@@ -871,7 +912,7 @@ CRDTSQLite::merge_changes(std::vector<Change<CrdtRecordId, std::string>> changes
     }
 
     // Increment and update clock
-    if (current_clock == UINT64_MAX) {
+    if (current_clock >= UINT64_MAX) {
       throw CRDTSQLiteException(
         "Clock overflow: reached UINT64_MAX (" + std::to_string(UINT64_MAX) + "). "
         "Cannot increment clock further. After 2^64 operations, the clock wraps to 0, "
@@ -884,7 +925,10 @@ CRDTSQLite::merge_changes(std::vector<Change<CrdtRecordId, std::string>> changes
       std::string update_clock = "UPDATE " + clock_table + " SET time = ?";
       Statement stmt(prepare(update_clock.c_str()));
       sqlite3_bind_int64(stmt.get(), 1, current_clock);
-      sqlite3_step(stmt.get());
+      int rc = sqlite3_step(stmt.get());
+      if (rc != SQLITE_DONE) {
+        throw CRDTSQLiteException("Failed to update clock: " + get_error());
+      }
       // Statement auto-finalized here
     }
 
@@ -924,7 +968,10 @@ size_t CRDTSQLite::compact_tombstones(uint64_t min_acknowledged_version) {
   {
     Statement stmt(prepare(delete_sql.c_str()));
     sqlite3_bind_int64(stmt.get(), 1, min_acknowledged_version);
-    sqlite3_step(stmt.get());
+    int rc = sqlite3_step(stmt.get());
+    if (rc != SQLITE_DONE) {
+      throw CRDTSQLiteException("Failed to delete tombstones: " + get_error());
+    }
     removed = sqlite3_changes(db_);
     // Statement auto-finalized here
   }
@@ -937,7 +984,10 @@ size_t CRDTSQLite::compact_tombstones(uint64_t min_acknowledged_version) {
         std::string delete_lookaside = "DELETE FROM " + lookaside_table + " WHERE id = ?";
         Statement stmt(prepare(delete_lookaside.c_str()));
         RecordIdTraits<CrdtRecordId>::bind_to_sqlite(stmt.get(), 1, id);
-        sqlite3_step(stmt.get());
+        int rc = sqlite3_step(stmt.get());
+        if (rc != SQLITE_DONE) {
+          throw CRDTSQLiteException("Failed to delete lookaside entry: " + get_error());
+        }
         // Statement auto-finalized here
       }
     }
@@ -1117,7 +1167,7 @@ void CRDTSQLite::process_pending_changes() {
 
   // Get and increment clock
   uint64_t current_clock = get_clock();
-  if (current_clock == UINT64_MAX) {
+  if (current_clock >= UINT64_MAX) {
     // Clock overflow detected - clean up pending changes and set flag
     std::fprintf(stderr, "CRDT-SQLite FATAL: Clock overflow at UINT64_MAX. Database cannot accept more changes.\n");
 
@@ -1144,7 +1194,10 @@ void CRDTSQLite::process_pending_changes() {
         sqlite3_bind_int64(stmt.get(), 2, current_clock);
         sqlite3_bind_int64(stmt.get(), 3, node_id_);
         sqlite3_bind_int64(stmt.get(), 4, current_clock);
-        sqlite3_step(stmt.get());
+        int rc = sqlite3_step(stmt.get());
+        if (rc != SQLITE_DONE) {
+          throw CRDTSQLiteException("Failed to create tombstone in process_pending_changes: " + get_error());
+        }
         // Auto-finalized
       }
 
@@ -1153,7 +1206,10 @@ void CRDTSQLite::process_pending_changes() {
         std::string delete_versions = "DELETE FROM " + versions_table + " WHERE record_id = ?";
         Statement stmt(prepare(delete_versions.c_str()));
         RecordIdTraits<CrdtRecordId>::bind_to_sqlite(stmt.get(), 1, pending.record_id);
-        sqlite3_step(stmt.get());
+        int rc = sqlite3_step(stmt.get());
+        if (rc != SQLITE_DONE) {
+          throw CRDTSQLiteException("Failed to delete version metadata: " + get_error());
+        }
         // Auto-finalized
       }
 
@@ -1190,7 +1246,10 @@ void CRDTSQLite::process_pending_changes() {
         std::string delete_sql = "DELETE FROM " + tracked_table_ + " WHERE " + id_column + " = ?";
         Statement stmt(prepare(delete_sql.c_str()));
         RecordIdTraits<CrdtRecordId>::bind_to_sqlite(stmt.get(), 1, pending.record_id);
-        sqlite3_step(stmt.get());
+        int rc = sqlite3_step(stmt.get());
+        if (rc != SQLITE_DONE) {
+          throw CRDTSQLiteException("Failed to enforce tombstone deletion: " + get_error());
+        }
         // Skip version metadata creation - record is tombstoned
         continue;
       }
@@ -1220,7 +1279,10 @@ void CRDTSQLite::process_pending_changes() {
         sqlite3_bind_int64(stmt.get(), 4, current_clock);
         sqlite3_bind_int64(stmt.get(), 5, node_id_);
         sqlite3_bind_int64(stmt.get(), 6, current_clock);
-        sqlite3_step(stmt.get());
+        int rc = sqlite3_step(stmt.get());
+        if (rc != SQLITE_DONE) {
+          throw CRDTSQLiteException("Failed to insert version metadata: " + get_error());
+        }
         // Auto-finalized
       }
     }
@@ -1232,7 +1294,10 @@ void CRDTSQLite::process_pending_changes() {
     std::string update_clock = "UPDATE " + clock_table + " SET time = ?";
     Statement stmt(prepare(update_clock.c_str()));
     sqlite3_bind_int64(stmt.get(), 1, current_clock);
-    sqlite3_step(stmt.get());
+    int rc = sqlite3_step(stmt.get());
+    if (rc != SQLITE_DONE) {
+      throw CRDTSQLiteException("Failed to update clock in process_pending_changes: " + get_error());
+    }
     // Auto-finalized
   }
 
@@ -1245,18 +1310,9 @@ void CRDTSQLite::apply_to_sqlite(const std::vector<Change<CrdtRecordId, std::str
   // Temporarily disable triggers to avoid recursion when applying remote changes
   std::string pending_table = "_crdt_" + tracked_table_ + "_pending";
 
-  // Get column names BEFORE dropping triggers (needed for restoration)
-  std::vector<std::string> columns;
-  {
-    std::string pragma_sql = "PRAGMA table_info(" + tracked_table_ + ")";
-    Statement stmt(prepare(pragma_sql.c_str()));
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-      const char *col_name = reinterpret_cast<const char *>(sqlite3_column_text(stmt.get(), 1));
-      if (col_name) {
-        columns.push_back(col_name);
-      }
-    }
-  }
+  // PERFORMANCE: Use cached column names to avoid redundant PRAGMA query
+  // cached_columns_ is populated during enable_crdt() and kept up-to-date by refresh_schema()
+  std::vector<std::string> columns = cached_columns_;
 
   // RAII guard to ensure triggers are always restored (construct BEFORE dropping)
   TriggerGuard guard(this, tracked_table_, columns);
@@ -1280,7 +1336,10 @@ void CRDTSQLite::apply_to_sqlite(const std::vector<Change<CrdtRecordId, std::str
       std::string delete_sql = "DELETE FROM " + tracked_table_ + " WHERE " + id_column + " = ?";
       Statement stmt(prepare(delete_sql.c_str()));
       RecordIdTraits<CrdtRecordId>::bind_to_sqlite(stmt.get(), 1, change.record_id);
-      sqlite3_step(stmt.get());
+      int rc = sqlite3_step(stmt.get());
+      if (rc != SQLITE_DONE) {
+        throw CRDTSQLiteException("Failed to delete record in apply_to_sqlite: " + get_error());
+      }
       // Auto-finalized
     } else {
       // Validate column name to prevent SQL injection
@@ -1294,7 +1353,10 @@ void CRDTSQLite::apply_to_sqlite(const std::vector<Change<CrdtRecordId, std::str
         std::string check_sql = "SELECT COUNT(*) FROM " + tracked_table_ + " WHERE " + id_column + " = ?";
         Statement stmt(prepare(check_sql.c_str()));
         RecordIdTraits<CrdtRecordId>::bind_to_sqlite(stmt.get(), 1, change.record_id);
-        sqlite3_step(stmt.get());
+        int rc = sqlite3_step(stmt.get());
+        if (rc != SQLITE_ROW) {
+          throw CRDTSQLiteException("Failed to check record existence: " + get_error());
+        }
         count = sqlite3_column_int(stmt.get(), 0);
         // Auto-finalized
       }
@@ -1306,7 +1368,10 @@ void CRDTSQLite::apply_to_sqlite(const std::vector<Change<CrdtRecordId, std::str
                                   *change.col_name + " = NULL WHERE " + id_column + " = ?";
           Statement stmt(prepare(update_sql.c_str()));
           RecordIdTraits<CrdtRecordId>::bind_to_sqlite(stmt.get(), 1, change.record_id);
-          sqlite3_step(stmt.get());
+          int rc = sqlite3_step(stmt.get());
+          if (rc != SQLITE_DONE) {
+            throw CRDTSQLiteException("Failed to set field to NULL: " + get_error());
+          }
           // Auto-finalized
         }
       } else {
@@ -1345,7 +1410,10 @@ void CRDTSQLite::apply_to_sqlite(const std::vector<Change<CrdtRecordId, std::str
             break;
           }
 
-          sqlite3_step(stmt.get());
+          int rc = sqlite3_step(stmt.get());
+          if (rc != SQLITE_DONE) {
+            throw CRDTSQLiteException("Failed to insert record: " + get_error());
+          }
           // Auto-finalized
         } else {
           // Update existing record
@@ -1372,7 +1440,10 @@ void CRDTSQLite::apply_to_sqlite(const std::vector<Change<CrdtRecordId, std::str
           }
 
           RecordIdTraits<CrdtRecordId>::bind_to_sqlite(stmt.get(), 2, change.record_id);
-          sqlite3_step(stmt.get());
+          int rc = sqlite3_step(stmt.get());
+          if (rc != SQLITE_DONE) {
+            throw CRDTSQLiteException("Failed to update record: " + get_error());
+          }
           // Auto-finalized
         }
       }

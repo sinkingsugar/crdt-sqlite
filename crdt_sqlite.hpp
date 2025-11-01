@@ -303,6 +303,9 @@ private:
   // Column type cache (column_name -> Type)
   std::unordered_map<std::string, SQLiteValue::Type> column_types_;
 
+  // Cached column names from PRAGMA table_info() to avoid redundant queries
+  std::vector<std::string> cached_columns_;
+
   // Schema change tracking (for ALTER TABLE auto-handling)
   bool pending_schema_refresh_;
 
