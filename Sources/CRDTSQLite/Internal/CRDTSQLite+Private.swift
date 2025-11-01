@@ -81,7 +81,10 @@ extension CRDTSQLite {
             let checkStmt = try prepareSQLOrThrow(db, "SELECT COUNT(*) FROM \(clockTable)")
             defer { sqlite3_finalize(checkStmt) }
 
-            sqlite3_step(checkStmt)
+            guard sqlite3_step(checkStmt) == SQLITE_ROW else {
+                let message = String(cString: sqlite3_errmsg(db))
+                throw CRDTError.internalError("Failed to check clock table: \(message)")
+            }
             let count = sqlite3_column_int(checkStmt, 0)
 
             if count == 0 {
@@ -124,19 +127,9 @@ extension CRDTSQLite {
                 }
             }
 
-            // Get column names for trigger creation
-            var columns: [String] = []
-            let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
-            defer { sqlite3_finalize(stmt) }
-
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let cString = sqlite3_column_text(stmt, 1) {
-                    columns.append(String(cString: cString))
-                }
-            }
-
+            // Use cached columns for trigger creation (already populated by cacheColumnTypes)
             // Create triggers
-            try createTriggers(tableName: tableName, columns: columns, useIfNotExists: true)
+            try createTriggers(tableName: tableName, columns: cachedColumns, useIfNotExists: true)
 
             // Commit transaction
             try executeSQLOrThrow(db, "COMMIT")
@@ -213,6 +206,7 @@ extension CRDTSQLite {
         }
 
         columnTypes.removeAll()
+        cachedColumns.removeAll()
 
         let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
         defer { sqlite3_finalize(stmt) }
@@ -225,6 +219,9 @@ extension CRDTSQLite {
 
             let colName = String(cString: colNameC)
             let colTypeStr = String(cString: colTypeC).uppercased()
+
+            // Cache column name
+            cachedColumns.append(colName)
 
             // Map SQL type to SQLite type code
             let colType: Int32
@@ -273,21 +270,11 @@ extension CRDTSQLite {
         // Drop triggers to prevent recursive tracking
         try dropTriggers(tableName: tableName)
 
-        // Get columns for trigger recreation
-        var columns: [String] = []
-        let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
-        defer { sqlite3_finalize(stmt) }
-
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let cString = sqlite3_column_text(stmt, 1) {
-                columns.append(String(cString: cString))
-            }
-        }
-
+        // Use cached columns for trigger recreation
         // Ensure triggers are restored even if error occurs
         defer {
             do {
-                try createTriggers(tableName: tableName, columns: columns, useIfNotExists: false)
+                try createTriggers(tableName: tableName, columns: cachedColumns, useIfNotExists: false)
             } catch {
                 // Store error for later retrieval - cannot throw from defer
                 lastCallbackError = CRDTError.internalError("CRITICAL: Failed to restore triggers for \(tableName): \(error)")
@@ -309,7 +296,11 @@ extension CRDTSQLite {
                 defer { sqlite3_finalize(deleteStmt) }
 
                 try bindRecordId(change.recordId, to: deleteStmt, at: 1)
-                sqlite3_step(deleteStmt)
+                let result = sqlite3_step(deleteStmt)
+                guard result == SQLITE_DONE else {
+                    let message = String(cString: sqlite3_errmsg(db))
+                    throw CRDTError.internalError("Failed to delete record: \(message)")
+                }
             } else {
                 guard let columnName = change.columnName else { continue }
 
@@ -334,7 +325,11 @@ extension CRDTSQLite {
 
                     _ = change.value?.bind(to: updateStmt, at: 1) ?? sqlite3_bind_null(updateStmt, 1)
                     try bindRecordId(change.recordId, to: updateStmt, at: 2)
-                    sqlite3_step(updateStmt)
+                    let result = sqlite3_step(updateStmt)
+                    guard result == SQLITE_DONE else {
+                        let message = String(cString: sqlite3_errmsg(db))
+                        throw CRDTError.internalError("Failed to update record: \(message)")
+                    }
                 } else {
                     // Insert new record with just the ID and this column
                     // CRDT builds up records column-by-column
@@ -355,7 +350,11 @@ extension CRDTSQLite {
 
                         _ = change.value?.bind(to: updateStmt, at: 1) ?? sqlite3_bind_null(updateStmt, 1)
                         try bindRecordId(change.recordId, to: updateStmt, at: 2)
-                        sqlite3_step(updateStmt)
+                        let updateResult = sqlite3_step(updateStmt)
+                        guard updateResult == SQLITE_DONE else {
+                            let message = String(cString: sqlite3_errmsg(db))
+                            throw CRDTError.internalError("Failed to update record after INSERT OR IGNORE: \(message)")
+                        }
                     }
                 }
 
@@ -398,7 +397,11 @@ extension CRDTSQLite {
         sqlite3_bind_int64(stmt, 3, Int64(change.nodeId))
         sqlite3_bind_int64(stmt, 4, Int64(change.localDbVersion))
 
-        sqlite3_step(stmt)
+        let result = sqlite3_step(stmt)
+        guard result == SQLITE_DONE else {
+            let message = String(cString: sqlite3_errmsg(db))
+            throw CRDTError.internalError("Failed to insert tombstone: \(message)")
+        }
     }
 
     internal func updateTombstone(tableName: String, change: Change<RecordID>) throws {
@@ -431,7 +434,11 @@ extension CRDTSQLite {
         sqlite3_bind_int64(stmt, 5, Int64(nodeId))
         sqlite3_bind_int64(stmt, 6, Int64(localDbVersion))
 
-        sqlite3_step(stmt)
+        let result = sqlite3_step(stmt)
+        guard result == SQLITE_DONE else {
+            let message = String(cString: sqlite3_errmsg(db))
+            throw CRDTError.internalError("Failed to update version table: \(message)")
+        }
     }
 
     // MARK: - Change Processing
@@ -488,7 +495,11 @@ extension CRDTSQLite {
                     sqlite3_bind_int64(insertStmt, 3, Int64(nodeId))
                     sqlite3_bind_int64(insertStmt, 4, Int64(currentClock))
 
-                    sqlite3_step(insertStmt)
+                    let result = sqlite3_step(insertStmt)
+                    guard result == SQLITE_DONE else {
+                        let message = String(cString: sqlite3_errmsg(db))
+                        throw CRDTError.internalError("Failed to insert tombstone in pending changes: \(message)")
+                    }
                 } else {
                     // Handle insert/update
                     // Get current col_version for this column

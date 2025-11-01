@@ -56,6 +56,7 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     internal let nodeId: UInt64
     internal var trackedTable: String?
     internal var columnTypes: [String: Int32] = [:]
+    internal var cachedColumns: [String] = []  // Cached column names from PRAGMA
     internal var pendingSchemaRefresh = false
     internal var processingWalChanges = false
     internal var clockOverflow = false
@@ -270,23 +271,12 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
             throw CRDTError.tableNameInvalid(tableName)
         }
 
-        // Re-cache column types
+        // Re-cache column types (also updates cachedColumns)
         try cacheColumnTypes(tableName: tableName)
 
-        // Get current columns
-        var columns: [String] = []
-        let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
-        defer { sqlite3_finalize(stmt) }
-
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let cString = sqlite3_column_text(stmt, 1) {
-                columns.append(String(cString: cString))
-            }
-        }
-
-        // Recreate triggers
+        // Recreate triggers using cached columns
         try dropTriggers(tableName: tableName)
-        try createTriggers(tableName: tableName, columns: columns, useIfNotExists: false)
+        try createTriggers(tableName: tableName, columns: cachedColumns, useIfNotExists: false)
 
         // Update column types table
         let typesTable = "_crdt_\(tableName)_types"
