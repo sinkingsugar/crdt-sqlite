@@ -101,11 +101,11 @@ public enum SQLiteValue: Codable, Hashable {
             return sqlite3_bind_double(statement, index, value)
 
         case .text(let value):
-            return sqlite3_bind_text(statement, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            return sqlite3_bind_text(statement, index, value, -1, SQLITE_TRANSIENT)
 
         case .blob(let value):
             return value.withUnsafeBytes { bytes in
-                sqlite3_bind_blob(statement, index, bytes.baseAddress, Int32(bytes.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                sqlite3_bind_blob(statement, index, bytes.baseAddress, Int32(bytes.count), SQLITE_TRANSIENT)
             }
         }
     }

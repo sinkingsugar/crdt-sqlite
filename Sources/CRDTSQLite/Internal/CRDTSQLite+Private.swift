@@ -8,110 +8,143 @@ extension CRDTSQLite {
     // MARK: - Shadow Tables
 
     internal func createShadowTables(tableName: String) throws {
-        let recordIdType = RecordID.self == Int64.self ? "INTEGER" : "BLOB"
-
-        // Create versions table
-        let versionsTable = "_crdt_\(tableName)_versions"
-        let createVersions = """
-            CREATE TABLE IF NOT EXISTS \(versionsTable) (
-                record_id \(recordIdType) NOT NULL,
-                col_name TEXT NOT NULL,
-                col_version INTEGER NOT NULL,
-                db_version INTEGER NOT NULL,
-                node_id INTEGER NOT NULL,
-                local_db_version INTEGER NOT NULL,
-                PRIMARY KEY (record_id, col_name)
-            )
-            """
-        try executeSQLOrThrow(db, createVersions)
-
-        // Create index on local_db_version for efficient sync queries
-        try executeSQLOrThrow(db, """
-            CREATE INDEX IF NOT EXISTS \(versionsTable)_local_db_version_idx
-            ON \(versionsTable)(local_db_version)
-            """)
-
-        // Create tombstones table
-        let tombstonesTable = "_crdt_\(tableName)_tombstones"
-        let createTombstones = """
-            CREATE TABLE IF NOT EXISTS \(tombstonesTable) (
-                record_id \(recordIdType) PRIMARY KEY,
-                db_version INTEGER NOT NULL,
-                node_id INTEGER NOT NULL,
-                local_db_version INTEGER NOT NULL
-            )
-            """
-        try executeSQLOrThrow(db, createTombstones)
-
-        try executeSQLOrThrow(db, """
-            CREATE INDEX IF NOT EXISTS \(tombstonesTable)_local_db_version_idx
-            ON \(tombstonesTable)(local_db_version)
-            """)
-
-        // Create clock table
-        let clockTable = "_crdt_\(tableName)_clock"
-        try executeSQLOrThrow(db, """
-            CREATE TABLE IF NOT EXISTS \(clockTable) (
-                time INTEGER NOT NULL
-            )
-            """)
-
-        // Initialize clock if empty
-        let checkStmt = try prepareSQLOrThrow(db, "SELECT COUNT(*) FROM \(clockTable)")
-        defer { sqlite3_finalize(checkStmt) }
-
-        sqlite3_step(checkStmt)
-        let count = sqlite3_column_int(checkStmt, 0)
-
-        if count == 0 {
-            try executeSQLOrThrow(db, "INSERT INTO \(clockTable) VALUES (0)")
+        // Validate table name to prevent SQL injection in PRAGMA
+        guard tableName.isValidTableName else {
+            throw CRDTError.tableNameInvalid(tableName)
         }
 
-        // Create pending changes table
-        let pendingTable = "_crdt_\(tableName)_pending"
-        try executeSQLOrThrow(db, """
-            CREATE TABLE IF NOT EXISTS \(pendingTable) (
-                operation INTEGER NOT NULL,
-                record_id \(recordIdType) NOT NULL,
-                col_name TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (operation, record_id, col_name)
-            )
-            """)
+        // Use transaction for atomic schema changes
+        try executeSQLOrThrow(db, "BEGIN TRANSACTION")
 
-        // Create column types table
-        let typesTable = "_crdt_\(tableName)_types"
-        try executeSQLOrThrow(db, """
-            CREATE TABLE IF NOT EXISTS \(typesTable) (
-                col_name TEXT PRIMARY KEY,
-                col_type INTEGER NOT NULL
-            )
-            """)
+        do {
+            let recordIdType = RecordID.self == Int64.self ? "INTEGER" : "BLOB"
 
-        // Store column types
-        for (colName, colType) in columnTypes {
-            let stmt = try prepareSQLOrThrow(db, """
-                INSERT OR REPLACE INTO \(typesTable) (col_name, col_type) VALUES (?, ?)
+            // Create versions table
+            let versionsTable = "_crdt_\(tableName)_versions"
+            let createVersions = """
+                CREATE TABLE IF NOT EXISTS \(versionsTable) (
+                    record_id \(recordIdType) NOT NULL,
+                    col_name TEXT NOT NULL,
+                    col_version INTEGER NOT NULL,
+                    db_version INTEGER NOT NULL,
+                    node_id INTEGER NOT NULL,
+                    local_db_version INTEGER NOT NULL,
+                    PRIMARY KEY (record_id, col_name)
+                )
+                """
+            try executeSQLOrThrow(db, createVersions)
+
+            // Create index on local_db_version for efficient sync queries
+            try executeSQLOrThrow(db, """
+                CREATE INDEX IF NOT EXISTS \(versionsTable)_local_db_version_idx
+                ON \(versionsTable)(local_db_version)
                 """)
+
+            // Create index on node_id for efficient node filtering
+            try executeSQLOrThrow(db, """
+                CREATE INDEX IF NOT EXISTS \(versionsTable)_node_id_idx
+                ON \(versionsTable)(node_id)
+                """)
+
+            // Create tombstones table
+            let tombstonesTable = "_crdt_\(tableName)_tombstones"
+            let createTombstones = """
+                CREATE TABLE IF NOT EXISTS \(tombstonesTable) (
+                    record_id \(recordIdType) PRIMARY KEY,
+                    db_version INTEGER NOT NULL,
+                    node_id INTEGER NOT NULL,
+                    local_db_version INTEGER NOT NULL
+                )
+                """
+            try executeSQLOrThrow(db, createTombstones)
+
+            try executeSQLOrThrow(db, """
+                CREATE INDEX IF NOT EXISTS \(tombstonesTable)_local_db_version_idx
+                ON \(tombstonesTable)(local_db_version)
+                """)
+
+            // Create index on node_id for efficient node filtering
+            try executeSQLOrThrow(db, """
+                CREATE INDEX IF NOT EXISTS \(tombstonesTable)_node_id_idx
+                ON \(tombstonesTable)(node_id)
+                """)
+
+            // Create clock table
+            let clockTable = "_crdt_\(tableName)_clock"
+            try executeSQLOrThrow(db, """
+                CREATE TABLE IF NOT EXISTS \(clockTable) (
+                    time INTEGER NOT NULL
+                )
+                """)
+
+            // Initialize clock if empty
+            let checkStmt = try prepareSQLOrThrow(db, "SELECT COUNT(*) FROM \(clockTable)")
+            defer { sqlite3_finalize(checkStmt) }
+
+            sqlite3_step(checkStmt)
+            let count = sqlite3_column_int(checkStmt, 0)
+
+            if count == 0 {
+                try executeSQLOrThrow(db, "INSERT INTO \(clockTable) VALUES (0)")
+            }
+
+            // Create pending changes table
+            let pendingTable = "_crdt_\(tableName)_pending"
+            try executeSQLOrThrow(db, """
+                CREATE TABLE IF NOT EXISTS \(pendingTable) (
+                    operation INTEGER NOT NULL,
+                    record_id \(recordIdType) NOT NULL,
+                    col_name TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (operation, record_id, col_name)
+                )
+                """)
+
+            // Create column types table
+            let typesTable = "_crdt_\(tableName)_types"
+            try executeSQLOrThrow(db, """
+                CREATE TABLE IF NOT EXISTS \(typesTable) (
+                    col_name TEXT PRIMARY KEY,
+                    col_type INTEGER NOT NULL
+                )
+                """)
+
+            // Store column types
+            for (colName, colType) in columnTypes {
+                let stmt = try prepareSQLOrThrow(db, """
+                    INSERT OR REPLACE INTO \(typesTable) (col_name, col_type) VALUES (?, ?)
+                    """)
+                defer { sqlite3_finalize(stmt) }
+
+                sqlite3_bind_text(stmt, 1, colName, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_int(stmt, 2, colType)
+                let result = sqlite3_step(stmt)
+                guard result == SQLITE_DONE else {
+                    let message = String(cString: sqlite3_errmsg(db))
+                    throw CRDTError.internalError("Failed to insert column type: \(message)")
+                }
+            }
+
+            // Get column names for trigger creation
+            var columns: [String] = []
+            let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
             defer { sqlite3_finalize(stmt) }
 
-            sqlite3_bind_text(stmt, 1, colName, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-            sqlite3_bind_int(stmt, 2, colType)
-            sqlite3_step(stmt)
-        }
-
-        // Get column names for trigger creation
-        var columns: [String] = []
-        let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
-        defer { sqlite3_finalize(stmt) }
-
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let cString = sqlite3_column_text(stmt, 1) {
-                columns.append(String(cString: cString))
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let cString = sqlite3_column_text(stmt, 1) {
+                    columns.append(String(cString: cString))
+                }
             }
-        }
 
-        // Create triggers
-        try createTriggers(tableName: tableName, columns: columns, useIfNotExists: true)
+            // Create triggers
+            try createTriggers(tableName: tableName, columns: columns, useIfNotExists: true)
+
+            // Commit transaction
+            try executeSQLOrThrow(db, "COMMIT")
+        } catch {
+            // Rollback on error
+            try? executeSQLOrThrow(db, "ROLLBACK")
+            throw error
+        }
     }
 
     internal func createTriggers(tableName: String, columns: [String], useIfNotExists: Bool) throws {
@@ -174,6 +207,11 @@ extension CRDTSQLite {
     // MARK: - Column Type Caching
 
     internal func cacheColumnTypes(tableName: String) throws {
+        // Validate table name to prevent SQL injection in PRAGMA
+        guard tableName.isValidTableName else {
+            throw CRDTError.tableNameInvalid(tableName)
+        }
+
         columnTypes.removeAll()
 
         let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
@@ -227,25 +265,32 @@ extension CRDTSQLite {
     internal func applyToSQLite(changes: [Change<RecordID>]) throws {
         guard let tableName = trackedTable else { return }
 
+        // Validate table name to prevent SQL injection in PRAGMA
+        guard tableName.isValidTableName else {
+            throw CRDTError.tableNameInvalid(tableName)
+        }
+
         // Drop triggers to prevent recursive tracking
         try dropTriggers(tableName: tableName)
 
         // Get columns for trigger recreation
         var columns: [String] = []
         let stmt = try prepareSQLOrThrow(db, "PRAGMA table_info(\(tableName))")
+        defer { sqlite3_finalize(stmt) }
+
         while sqlite3_step(stmt) == SQLITE_ROW {
             if let cString = sqlite3_column_text(stmt, 1) {
                 columns.append(String(cString: cString))
             }
         }
-        sqlite3_finalize(stmt)
 
         // Ensure triggers are restored even if error occurs
         defer {
             do {
                 try createTriggers(tableName: tableName, columns: columns, useIfNotExists: false)
             } catch {
-                print("CRITICAL: Failed to restore triggers for \(tableName): \(error)")
+                // Store error for later retrieval - cannot throw from defer
+                lastCallbackError = CRDTError.internalError("CRITICAL: Failed to restore triggers for \(tableName): \(error)")
             }
         }
 
@@ -315,7 +360,7 @@ extension CRDTSQLite {
                 }
 
                 // Update version table
-                guard currentClock < UInt64.max else {
+                guard currentClock <= UInt64.max - 1 else {
                     throw CRDTError.clockOverflow
                 }
                 currentClock += 1
@@ -380,7 +425,7 @@ extension CRDTSQLite {
         defer { sqlite3_finalize(stmt) }
 
         try bindRecordId(recordId, to: stmt, at: 1)
-        sqlite3_bind_text(stmt, 2, columnName, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(stmt, 2, columnName, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 3, Int64(colVersion))
         sqlite3_bind_int64(stmt, 4, Int64(dbVersion))
         sqlite3_bind_int64(stmt, 5, Int64(nodeId))
@@ -426,7 +471,7 @@ extension CRDTSQLite {
             for (operation, recordId, columnName) in pendingChanges {
                 if operation == OperationType.delete.rawValue {
                     // Handle delete (tombstone)
-                    guard currentClock < UInt64.max else {
+                    guard currentClock <= UInt64.max - 1 else {
                         throw CRDTError.clockOverflow
                     }
                     currentClock += 1
@@ -455,7 +500,7 @@ extension CRDTSQLite {
                     defer { sqlite3_finalize(versionStmt) }
 
                     try bindRecordId(recordId, to: versionStmt, at: 1)
-                    sqlite3_bind_text(versionStmt, 2, columnName, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                    sqlite3_bind_text(versionStmt, 2, columnName, -1, SQLITE_TRANSIENT)
 
                     var colVersion: UInt64 = 0
                     if sqlite3_step(versionStmt) == SQLITE_ROW {
@@ -464,7 +509,7 @@ extension CRDTSQLite {
 
                     // Increment version counters
                     colVersion += 1
-                    guard currentClock < UInt64.max else {
+                    guard currentClock <= UInt64.max - 1 else {
                         throw CRDTError.clockOverflow
                     }
                     currentClock += 1
@@ -490,7 +535,8 @@ extension CRDTSQLite {
             try executeSQLOrThrow(db, "UPDATE \(clockTable) SET time = \(currentClock)")
 
         } catch {
-            print("Error processing pending changes: \(error)")
+            // Store error for later retrieval - callbacks cannot throw
+            lastCallbackError = error
         }
     }
 
@@ -516,7 +562,8 @@ extension CRDTSQLite {
         do {
             try executeSQLOrThrow(db, "DELETE FROM \(pendingTable)")
         } catch {
-            print("Error clearing pending table on rollback: \(error)")
+            // Store error for later retrieval - callbacks cannot throw
+            lastCallbackError = error
         }
     }
 
@@ -524,7 +571,11 @@ extension CRDTSQLite {
 
     internal func readRecordId(from stmt: OpaquePointer, column: Int32) throws -> RecordID {
         if RecordID.self == Int64.self {
-            return sqlite3_column_int64(stmt, column) as! RecordID
+            let int64Value = sqlite3_column_int64(stmt, column)
+            guard let recordId = int64Value as? RecordID else {
+                throw CRDTError.internalError("Failed to cast Int64 to RecordID")
+            }
+            return recordId
         } else if RecordID.self == UUID.self {
             guard let blob = sqlite3_column_blob(stmt, column) else {
                 throw CRDTError.internalError("Failed to read UUID from column \(column)")
@@ -535,7 +586,10 @@ extension CRDTSQLite {
             guard let uuid = UUID(data: data) else {
                 throw CRDTError.internalError("Failed to create UUID from data")
             }
-            return uuid as! RecordID
+            guard let recordId = uuid as? RecordID else {
+                throw CRDTError.internalError("Failed to cast UUID to RecordID")
+            }
+            return recordId
         } else {
             throw CRDTError.internalError("Unsupported RecordID type")
         }
@@ -543,13 +597,17 @@ extension CRDTSQLite {
 
     internal func bindRecordId(_ recordId: RecordID, to stmt: OpaquePointer, at index: Int32) throws {
         if RecordID.self == Int64.self {
-            let int64Value = recordId as! Int64
+            guard let int64Value = recordId as? Int64 else {
+                throw CRDTError.internalError("Failed to cast RecordID to Int64")
+            }
             sqlite3_bind_int64(stmt, index, int64Value)
         } else if RecordID.self == UUID.self {
-            let uuid = recordId as! UUID
+            guard let uuid = recordId as? UUID else {
+                throw CRDTError.internalError("Failed to cast RecordID to UUID")
+            }
             let data = uuid.data
             _ = data.withUnsafeBytes { bytes in
-                sqlite3_bind_blob(stmt, index, bytes.baseAddress, Int32(bytes.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                sqlite3_bind_blob(stmt, index, bytes.baseAddress, Int32(bytes.count), SQLITE_TRANSIENT)
             }
         } else {
             throw CRDTError.internalError("Unsupported RecordID type")

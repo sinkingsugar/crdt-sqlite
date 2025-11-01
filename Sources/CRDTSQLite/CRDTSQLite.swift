@@ -4,6 +4,12 @@
 import Foundation
 import SQLite3
 
+// MARK: - SQLite Constants
+
+/// SQLITE_TRANSIENT tells SQLite to make a copy of the data before returning.
+/// Defined once to avoid repeated unsafeBitCast which is undefined behavior.
+internal let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 // MARK: - Constants and Types
 
 internal enum CRDTConstants {
@@ -54,6 +60,7 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     internal var processingWalChanges = false
     internal var clockOverflow = false
     private var callbackBox: Unmanaged<CallbackBox>?
+    internal var lastCallbackError: Error?
 
     // MARK: - Initialization
 
@@ -81,11 +88,16 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
 
         self.db = db
 
-        // Enable foreign keys
-        try executeSQLOrThrow(db, "PRAGMA foreign_keys = ON")
+        // Enable foreign keys - close DB on failure
+        do {
+            try executeSQLOrThrow(db, "PRAGMA foreign_keys = ON")
 
-        // Enable WAL mode for better concurrency
-        try executeSQLOrThrow(db, "PRAGMA journal_mode=WAL")
+            // Enable WAL mode for better concurrency
+            try executeSQLOrThrow(db, "PRAGMA journal_mode=WAL")
+        } catch {
+            sqlite3_close(db)
+            throw error
+        }
 
         // Install hooks using callback bridge
         let box = CallbackBox(handler: self)
@@ -139,7 +151,7 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
         let stmt = try prepareSQLOrThrow(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?")
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, tableName, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(stmt, 1, tableName, -1, SQLITE_TRANSIENT)
 
         guard sqlite3_step(stmt) == SQLITE_ROW else {
             throw CRDTError.internalError("Table does not exist: \(tableName)")
@@ -161,6 +173,9 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     /// - Throws: `CRDTError` if execution fails
     public func execute(_ sql: String) throws {
         try executeSQLOrThrow(db, sql)
+
+        // Check for callback errors
+        try throwIfCallbackError()
 
         // Handle schema refresh if ALTER TABLE was detected
         if pendingSchemaRefresh {
@@ -187,6 +202,20 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     /// Use with caution - direct modifications bypass CRDT tracking
     public var rawDatabase: OpaquePointer {
         return db
+    }
+
+    /// Checks for and throws any errors that occurred in callbacks
+    ///
+    /// SQLite callbacks cannot throw errors directly, so errors are stored
+    /// and can be checked with this method. Call this after operations that
+    /// trigger callbacks (execute, mergeChanges, etc).
+    ///
+    /// - Throws: The last error that occurred in a callback, if any
+    public func throwIfCallbackError() throws {
+        if let error = lastCallbackError {
+            lastCallbackError = nil
+            throw error
+        }
     }
 
     /// Gets the current logical clock value
@@ -236,6 +265,11 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     public func refreshSchema() throws {
         guard let tableName = trackedTable else { return }
 
+        // Validate table name to prevent SQL injection in PRAGMA
+        guard tableName.isValidTableName else {
+            throw CRDTError.tableNameInvalid(tableName)
+        }
+
         // Re-cache column types
         try cacheColumnTypes(tableName: tableName)
 
@@ -261,9 +295,13 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
             let stmt = try prepareSQLOrThrow(db, sql)
             defer { sqlite3_finalize(stmt) }
 
-            sqlite3_bind_text(stmt, 1, colName, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_bind_text(stmt, 1, colName, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int(stmt, 2, colType)
-            sqlite3_step(stmt)
+            let result = sqlite3_step(stmt)
+            guard result == SQLITE_DONE else {
+                let message = String(cString: sqlite3_errmsg(db))
+                throw CRDTError.internalError("Failed to insert column type: \(message)")
+            }
         }
     }
 
@@ -277,7 +315,7 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     /// - Returns: Array of changes that occurred after the given version
     /// - Throws: `CRDTError` on failure
     public func getChangesSince(_ version: UInt64, maxChanges: Int = 0) throws -> [Change<RecordID>] {
-        return try getChangesSinceExcluding(version, excluding: [])
+        return try getChangesSinceExcluding(version, excluding: [], maxChanges: maxChanges)
     }
 
     /// Gets changes since a version, excluding specific nodes
@@ -285,9 +323,10 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
     /// - Parameters:
     ///   - version: Version to get changes since
     ///   - excluding: Set of node IDs to exclude (max 100 nodes)
+    ///   - maxChanges: Maximum number of changes to return (0 = unlimited)
     /// - Returns: Array of changes
     /// - Throws: `CRDTError` if excluding.count > 100
-    public func getChangesSinceExcluding(_ version: UInt64, excluding: Set<UInt64>) throws -> [Change<RecordID>] {
+    public func getChangesSinceExcluding(_ version: UInt64, excluding: Set<UInt64>, maxChanges: Int = 0) throws -> [Change<RecordID>] {
         guard let tableName = trackedTable else {
             throw CRDTError.noTrackedTable
         }
@@ -312,6 +351,11 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
 
         sql += " ORDER BY local_db_version"
 
+        // Add LIMIT clause if maxChanges is specified
+        if maxChanges > 0 {
+            sql += " LIMIT \(maxChanges)"
+        }
+
         let stmt = try prepareSQLOrThrow(db, sql)
         defer { sqlite3_finalize(stmt) }
 
@@ -325,6 +369,10 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
 
         // Fetch column changes
         while sqlite3_step(stmt) == SQLITE_ROW {
+            // Stop if we've reached maxChanges limit
+            if maxChanges > 0 && changes.count >= maxChanges {
+                break
+            }
             let recordId = try readRecordId(from: stmt, column: 0)
             let colName = String(cString: sqlite3_column_text(stmt, 1))
             let colVersion = UInt64(sqlite3_column_int64(stmt, 2))
@@ -361,6 +409,15 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
 
         sql += " ORDER BY local_db_version"
 
+        // Add LIMIT clause if maxChanges is specified
+        let remainingLimit = maxChanges > 0 ? max(0, maxChanges - changes.count) : 0
+        if remainingLimit > 0 {
+            sql += " LIMIT \(remainingLimit)"
+        } else if maxChanges > 0 {
+            // Already reached limit, skip tombstones query
+            return changes.sorted { $0.localDbVersion < $1.localDbVersion }
+        }
+
         let tombstoneStmt = try prepareSQLOrThrow(db, sql)
         defer { sqlite3_finalize(tombstoneStmt) }
 
@@ -373,6 +430,10 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
         }
 
         while sqlite3_step(tombstoneStmt) == SQLITE_ROW {
+            // Stop if we've reached maxChanges limit
+            if maxChanges > 0 && changes.count >= maxChanges {
+                break
+            }
             let recordId = try readRecordId(from: tombstoneStmt, column: 0)
             let dbVersion = UInt64(sqlite3_column_int64(tombstoneStmt, 1))
             let nodeId = UInt64(sqlite3_column_int64(tombstoneStmt, 2))
@@ -459,7 +520,7 @@ public final class CRDTSQLite<RecordID: CRDTRecordID>: CRDTCallbackHandler {
                 defer { sqlite3_finalize(stmt) }
 
                 try bindRecordId(remoteChange.recordId, to: stmt, at: 1)
-                sqlite3_bind_text(stmt, 2, columnName, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                sqlite3_bind_text(stmt, 2, columnName, -1, SQLITE_TRANSIENT)
 
                 if sqlite3_step(stmt) == SQLITE_ROW {
                     // Local version exists, compare using LWW
