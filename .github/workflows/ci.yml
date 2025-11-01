@@ -110,6 +110,32 @@ jobs:
           build/Testing/
           build/**/*.log
 
+  test-swift-macos:
+    name: Test Swift on macOS
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Print Swift version
+      run: swift --version
+
+    - name: Build Swift package
+      run: swift build -v
+
+    - name: Run Swift tests
+      run: swift test --parallel
+
+    - name: Upload test results
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-swift-macos
+        path: |
+          .build/
+          **/*.log
+
   test-windows:
     name: Test on Windows
     runs-on: windows-latest
